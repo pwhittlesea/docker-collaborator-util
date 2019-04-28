@@ -1,5 +1,5 @@
-var dockerHubAPI = require('docker-hub-api');
-var dogapi = require("dogapi");
+const dockerHubAPI = require('docker-hub-api');
+const { createLogger, format, transports } = require('winston');
 
 // Command line arguments
 var argv = require('yargs')
@@ -35,18 +35,6 @@ var argv = require('yargs')
     describe: 'Do not change the repositories, only WARN of required changes',
     count: true
   })
-  .option('datadogKey', {
-    describe: 'The datadog API key to use when sending metrics',
-    nargs: 1
-  })
-  .option('datadogApp', {
-    describe: 'The datadog Application key to use when sending metrics',
-    nargs: 1
-  })
-  .option('verbose', {
-    describe: 'Verbose output',
-    count: true
-  })
   .demand(['u','p'])
   .argv;
 
@@ -54,10 +42,19 @@ var argv = require('yargs')
 var collaborators         = [];
 var dryRun                = false;
 var shouldFlagPublicRepos = false;
-var shouldSendStats       = false;
-var VERBOSE_LEVEL         = argv.verbose;
 
-INFO("The application will:");
+// Set up logger
+const logger = createLogger({
+  format: format.combine(
+    format.colorize(),
+    format.simple()
+  ),
+  transports: [
+    new transports.Console()
+  ]
+});
+
+logger.info("The application will:");
 
 // Check if we should actually action or WARN
 if (argv.d > 0) {
@@ -68,53 +65,34 @@ if (argv.d > 0) {
 if (argv.c != undefined) {
   collaborators = argv.c;
   if (dryRun) {
-    INFO("  - Flag repositories that don't have [" + collaborators + "] as collaborators");
+    logger.info("  - Flag repositories that don't have [" + collaborators + "] as collaborators");
   } else {
-    INFO("  - Ensure [" + collaborators + "] are collaborators on all projects");
+    logger.info("  - Ensure [" + collaborators + "] are collaborators on all projects");
   }
 }
 
 // Check if repos need to be private
 if (argv.v === 'private') {
   shouldFlagPublicRepos = true;
-  INFO("  - Flag repositories that are public");
-}
-
-// Check Datadog arguments
-if (argv.datadogApp != undefined && argv.datadogKey != undefined) {
-  shouldSendStats = true;
-  INFO("  - Send metrics to Datadog");
-
-  var options = { api_key: argv.datadogKey, app_key: argv.datadogApp };
-  DEBUG("Logging into Datadog with options: [" + JSON.stringify(options) + "]");
-  dogapi.initialize(options);
+  logger.info("  - Flag repositories that are public");
 }
 
 // Start by logging in and checking all the repositories
-DEBUG("Logging into Docker with username/password: '" + argv.u+ "' '" + argv.p + "'");
+logger.debug("Logging into Docker with username/password: '" + argv.u+ "' '" + argv.p + "'");
 dockerHubAPI.login(argv.u, argv.p).then(function (info) {
 
   // Now that we are logged in we can list the repos
   if (argv.r === undefined) {
-    analyseRepositories(argv.u)
+    analyseRepositories(argv.u).then(function(results) {
+      checkRegistrySettings()
+    });
   } else {
     analyseRepo(argv.u, argv.r)
   }
-  checkRegistrySettings()
 
 }).catch(function (error) {
-  ERROR("Error during login: " + error.message);
+  logger.error("Error during login: " + error.message);
 });
-
-
-/**
- * Logging functions.
- */
-function ERROR()  { VERBOSE_LEVEL >= 0 && console.log.apply(console, arguments); }
-function WARN()   { VERBOSE_LEVEL >= 0 && console.log.apply(console, arguments); }
-function INFO()   { VERBOSE_LEVEL >= 0 && console.log.apply(console, arguments); }
-function DEBUG()  { VERBOSE_LEVEL >= 2 && console.log.apply(console, arguments); }
-
 
 /**
  * Analyse all the repositories for a username
@@ -122,14 +100,14 @@ function DEBUG()  { VERBOSE_LEVEL >= 2 && console.log.apply(console, arguments);
  * @param username the Docker username to check
  */
 function analyseRepositories(username) {
-  dockerHubAPI.repositories(username).then(function (repos) {
+  return dockerHubAPI.repositories(username).then(function (repos) {
 
     for(var repo in repos){
       analyseRepo(username, repos[repo].name);
     }
 
   }).catch(function (error) {
-    ERROR("Error when fetching all repositories: " + error.message);
+    logger.error("Error when fetching all repositories: " + error.message);
   });
 }
 
@@ -148,11 +126,11 @@ function analyseRepo(username, repository) {
   var collaboratorCheck = dockerHubAPI.collaborators(username, repository).then(function (info) { repoCollaborators = info; });
 
   // Wait for both checks to finish and then run the application checks
-  Promise.all([repositoryCheck, collaboratorCheck]).then(function (info) {
+  return Promise.all([repositoryCheck, collaboratorCheck]).then(function (info) {
 
     // Check if the repo is private
     if (shouldFlagPublicRepos && !repo.is_private == true) {
-      WARN("Repository " + repo.namespace + "/" + repo.name + " is public");
+      logger.warn("Repository " + repo.namespace + "/" + repo.name + " is public");
     }
 
     // Flatten the repo collaborators structure
@@ -163,17 +141,17 @@ function analyseRepo(username, repository) {
     for (var i in collaborators) {
       if (repoCollaboratorsFlattened.indexOf(collaborators[i]) === -1) {
         if (dryRun) {
-          WARN("Repository " + repo.namespace + "/" + repo.name + " does not have " + collaborators[i] + " as a collaborator");
+          logger.warn("Repository " + repo.namespace + "/" + repo.name + " does not have " + collaborators[i] + " as a collaborator");
         } else {
           Promise.all([dockerHubAPI.addCollaborator(username, repository, collaborators[i])]).catch(function (error) {
-            ERROR("Unable to add " + collaborators[i] + " as a collaborator on " + repo.namespace + "/" + repo.name);
+            logger.error("Unable to add " + collaborators[i] + " as a collaborator on " + repo.namespace + "/" + repo.name);
           });
         }
       }
     }
 
   }).catch(function (error) {
-    ERROR("Unable to get repo details");
+    logger.error("Unable to get repo details");
   });
 }
 
@@ -183,21 +161,13 @@ function checkRegistrySettings() {
   dockerHubAPI.registrySettings().then(function (info) {
 
     var privateReposUsedPct = ((info.private_repo_used / info.private_repo_limit) * 100).toFixed(2);
-    if (shouldFlagPublicRepos) {
-      WARN(info.private_repo_used + "/" + info.private_repo_limit + " (" + privateReposUsedPct + "%) private repositories used");
+    var msg = info.private_repo_used + "/" + info.private_repo_limit + " (" + privateReposUsedPct + "%) private repositories used";
+    if (privateReposUsedPct > 80) {
+      logger.warn(msg);
+    } else {
+      logger.info(msg);
     }
-
-    if (shouldSendStats) {
-      DEBUG("Sending docker.private_repos_used_pct|" + privateReposUsedPct + " to Datadog");
-      dogapi.metric.send("docker.private_repos_used_pct", privateReposUsedPct, function(err, results){
-        if (results.status == undefined) {
-          ERROR("Error while sending data to Datadog: " + err);
-          ERROR(results);
-        }
-      });
-    }
-
   }).catch(function (error) {
-    ERROR("Error when fetching all registry settings: " + error.message);
+    logger.error("Error when fetching all registry settings: " + error.message);
   });
 }
